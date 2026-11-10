@@ -6,13 +6,12 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-# ================= НАСТРОЙКИ (из переменных Bothost) =================
+# ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SHEET_CSV_URL = os.getenv("SHEET_CSV_URL")
 ANALYTICS_FILE = "analytics.json"
 
-# На Bothost (Нидерланды) прокси НЕ НУЖЕН
 session = AiohttpSession()
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
@@ -25,21 +24,37 @@ def load_mk_data():
         req = urllib.request.Request(SHEET_CSV_URL, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=15) as response:
             csv_data = response.read().decode('utf-8')
-        reader = csv.DictReader(csv_data.splitlines(), delimiter=';')
+        
+        # Умное определение разделителя: если есть ';', используем его, иначе ','
+        first_line = csv_data.split('\n')[0]
+        delimiter = ';' if ';' in first_line else ','
+        
+        reader = csv.DictReader(csv_data.splitlines(), delimiter=delimiter)
+        
+        # ОТЛАДКА: Печатаем заголовки, чтобы видеть их в логах Bothost
+        print(f"🔍 DEBUG: Заголовки в таблице: {reader.fieldnames}")
+        
         data = []
         for row in reader:
             try:
-                name = (row.get('name') or '').strip()
-                category = (row.get('category') or '').strip()
-                link = (row.get('link') or '').strip()
+                # Приводим все ключи к нижнему регистру и убираем пробелы для надёжности
+                clean_row = {k.strip().lower(): v.strip() for k, v in row.items() if k}
+                
+                name = clean_row.get('name', '')
+                category = clean_row.get('category', '')
+                link = clean_row.get('link', '')
+                
                 if not name or not category:
                     continue
+                    
                 data.append({"link": link, "name": name, "category": category})
-            except:
+            except Exception as e:
                 continue
+        
+        print(f"✅ DEBUG: Успешно загружено {len(data)} мастер-классов")
         return data
     except Exception as e:
-        print(f"Ошибка загрузки таблицы: {e}")
+        print(f"❌ Ошибка загрузки таблицы: {e}")
         return []
 
 def find_mk(category, limit=3, exclude_ids=None):
@@ -73,7 +88,13 @@ def get_main_keyboard():
         ("🎭 Необычное", "Необычное"), ("💃 Танцы", "Танцы"), ("🎵 Музыка", "Музыка"),
         ("📸 Фото", "Фото"), ("👶 Детский", "Детский"), ("📋 Разное", "Разное"),
     ]
-    buttons = [[InlineKeyboardButton(text=t, callback_data=f"cat_{c}")] for t, c in categories]
+    # Делаем по 2 кнопки в ряд для компактности (как вы просили)
+    buttons = []
+    for i in range(0, len(categories), 2):
+        row = [InlineKeyboardButton(text=categories[i][0], callback_data=f"cat_{categories[i][1]}")]
+        if i + 1 < len(categories):
+            row.append(InlineKeyboardButton(text=categories[i+1][0], callback_data=f"cat_{categories[i+1][1]}"))
+        buttons.append(row)
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ================= ОБРАБОТЧИКИ =================
