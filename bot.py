@@ -19,7 +19,7 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# Хранилище состояния пользователей
+# Состояние пользователей
 user_state = {}
 
 # ================= АНАЛИТИКА =================
@@ -75,6 +75,14 @@ def remove_favorite(user_id, mk_link):
         return True
     return False
 
+def clear_favorites(user_id):
+    favorites = load_favorites()
+    if str(user_id) in favorites:
+        del favorites[str(user_id)]
+        save_favorites(favorites)
+        return True
+    return False
+
 def get_user_favorites(user_id):
     favorites = load_favorites()
     return favorites.get(str(user_id), [])
@@ -100,7 +108,6 @@ def load_mk_data():
                 if not name or not category:
                     continue
                 
-                # Приоритет: если поле priority есть в таблице, используем его, иначе 1
                 priority = clean_row.get('priority', '1')
                 try:
                     priority = int(priority)
@@ -140,30 +147,27 @@ def get_mk_by_link(link):
             return mk
     return None
 
-def weighted_random_choice(items, k=3):
+def weighted_random_choice(items, k=3, exclude_links=None):
     """Взвешенный случайный выбор с учётом приоритета"""
     if not items:
         return []
+    exclude_links = exclude_links or []
+    available = [item for item in items if item['link'] not in exclude_links]
+    if not available:
+        return []
     
-    # Создаём пул с учётом приоритета (МК с priority=3 попадает в пул 3 раза)
     pool = []
-    for item in items:
+    for item in available:
         priority = item.get('priority', 1)
         pool.extend([item] * priority)
     
-    # Выбираем k уникальных элементов
     selected = []
     used_links = set()
     
-    for _ in range(k):
-        if not pool:
-            break
-        
-        # Фильтруем пул, исключая уже выбранные
+    for _ in range(min(k, len(available))):
         available_pool = [item for item in pool if item['link'] not in used_links]
         if not available_pool:
             break
-        
         chosen = random.choice(available_pool)
         selected.append(chosen)
         used_links.add(chosen['link'])
@@ -230,37 +234,38 @@ def get_main_keyboard():
         InlineKeyboardButton(text="🎲 Случайный", callback_data="random"),
         InlineKeyboardButton(text="❤️ Избранное", callback_data="show_fav")
     ])
+    buttons.append([
+        InlineKeyboardButton(text="❓ Помощь", callback_data="help")
+    ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_card_navigation_keyboard(user_id, mk, current_index, total_count, category, is_from_favorites=False, has_more=False):
-    """Клавиатура для навигации по карточкам"""
+def get_card_keyboard(user_id, mk, current_index, total_in_batch, has_next_in_batch, has_more_in_category, category, from_favorites=False):
+    """Клавиатура для карточки"""
     fav_status = is_favorite(user_id, mk['link'])
-    fav_text = "💔 Убрать" if fav_status else "❤️ В избранное"
+    fav_text = "💔 Убрать из избранного" if fav_status else "❤️ В избранное"
     fav_action = f"fav_remove_{mk['link']}" if fav_status else f"fav_add_{mk['link']}"
     
     buttons = []
     
-    # Кнопки навигации
+    # Навигация
     nav_row = []
     if current_index > 0:
         nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"nav_{category}_{current_index - 1}"))
-    if current_index < total_count - 1:
+    if has_next_in_batch:
         nav_row.append(InlineKeyboardButton(text="▶️ Вперёд", callback_data=f"nav_{category}_{current_index + 1}"))
+    elif has_more_in_category:
+        nav_row.append(InlineKeyboardButton(text="🔄 Ещё подборку", callback_data=f"new_batch_{category}"))
     if nav_row:
         buttons.append(nav_row)
     
-    # Кнопка "Ещё подборку" (если дошли до конца и есть ещё МК в категории)
-    if current_index == total_count - 1 and has_more:
-        buttons.append([InlineKeyboardButton(text="🔄 Ещё подборку", callback_data=f"new_batch_{category}")])
-    
-    # Кнопка избранного
+    # Избранное
     buttons.append([InlineKeyboardButton(text=fav_text, callback_data=fav_action)])
     
-    # Кнопка "В меню"
-    if is_from_favorites:
-        buttons.append([InlineKeyboardButton(text="📋 К избранному", callback_data="show_fav")])
+    # Меню
+    if from_favorites:
+        buttons.append([InlineKeyboardButton(text="📋 К списку избранного", callback_data="show_fav")])
     else:
-        buttons.append([InlineKeyboardButton(text="📋 В меню", callback_data="start")])
+        buttons.append([InlineKeyboardButton(text="📋 В главное меню", callback_data="start")])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -277,6 +282,35 @@ async def cmd_start(message: Message):
         parse_mode="HTML"
     )
 
+@router.message(Command("help"))
+@router.callback_query(F.data == "help")
+async def cmd_help(target):
+    help_text = (
+        "📖 <b>Как пользоваться ботом:</b>\n\n"
+        "🍳 <b>Выбор категории</b> — нажмите на кнопку с нужной категорией\n\n"
+        "🎯 <b>Просмотр МК</b> — бот покажет 3 мастер-класса из категории. "
+        "Используйте кнопки ◀️ Назад и ▶️ Вперёд для навигации\n\n"
+        "🔄 <b>Ещё подборку</b> — когда дойдёте до последнего МК, нажмите "
+        "«🔄 Ещё подборку» для новой тройки МК\n\n"
+        "❤️ <b>Избранное</b> — нажмите «❤️ В избранное» под карточкой, "
+        "чтобы сохранить МК. Смотреть избранное можно в главном меню\n\n"
+        "💔 <b>Удалить из избранного</b> — нажмите «💔 Убрать из избранного» "
+        "или зайдите в раздел «❤️ Избранное» и удалите ненужное\n\n"
+        "🎲 <b>Случайный МК</b> — кнопка в главном меню покажет случайный мастер-класс\n\n"
+        "📊 <b>Статистика</b> — команда /stats (только для админа)\n\n"
+        "⚠️ <i>Проверяйте актуальность МК перед записью!</i>"
+    )
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 В главное меню", callback_data="start")]
+    ])
+    
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(help_text, reply_markup=kb, parse_mode="HTML")
+        await target.answer()
+    else:
+        await target.answer(help_text, reply_markup=kb, parse_mode="HTML")
+
 @router.callback_query(F.data.startswith("cat_"))
 async def show_category(callback: CallbackQuery):
     category = callback.data.split("_", 1)[1]
@@ -291,34 +325,32 @@ async def show_category(callback: CallbackQuery):
         )
         return
     
-    # Взвешенный случайный выбор 3 МК
-    selected_mks = weighted_random_choice(all_mks, k=3)
+    # Взвешенный выбор 3 МК
+    selected = weighted_random_choice(all_mks, k=3)
     
-    # Сохраняем состояние
     user_state[callback.from_user.id] = {
         'category': category,
         'index': 0,
-        'mks': selected_mks,
-        'all_mks': all_mks,  # Все МК категории для проверки "Ещё подборку"
-        'from_favorites': False,
-        'shown_links': [mk['link'] for mk in selected_mks]
+        'mks': selected,
+        'all_mks': all_mks,
+        'shown_links': [mk['link'] for mk in selected],
+        'from_favorites': False
     }
     
-    mk = selected_mks[0]
+    mk = selected[0]
     log_action(callback.from_user.id, callback.from_user.username, "view", category, mk['link'])
     
-    # Проверяем, есть ли ещё МК для "Ещё подборку"
-    has_more = len(all_mks) > len(selected_mks)
+    has_next = len(selected) > 1
+    has_more = len(all_mks) > len(selected)
     
-    text = format_card(mk, 1, len(selected_mks))
-    kb = get_card_navigation_keyboard(callback.from_user.id, mk, 0, len(selected_mks), category, False, has_more)
+    text = format_card(mk, 1, len(selected))
+    kb = get_card_keyboard(callback.from_user.id, mk, 0, len(selected), has_next, has_more, category, False)
     
     await callback.message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
 
 @router.callback_query(F.data.startswith("nav_"))
 async def navigate_card(callback: CallbackQuery):
-    """Навигация между карточками"""
-    data = callback.data[4:]  # убираем "nav_"
+    data = callback.data[4:]
     parts = data.rsplit("_", 1)
     category = parts[0]
     new_index = int(parts[1])
@@ -335,26 +367,23 @@ async def navigate_card(callback: CallbackQuery):
         await callback.answer("Больше нет карточек", show_alert=True)
         return
     
-    # ВАЖНО: Обновляем индекс в состоянии
+    # Обновляем индекс
     state['index'] = new_index
     
     mk = mks[new_index]
     log_action(user_id, callback.from_user.username, "view", category, mk['link'])
     
-    # Проверяем, есть ли ещё МК для "Ещё подборку"
-    all_mks = state.get('all_mks', mks)
-    shown_links = state.get('shown_links', [])
-    has_more = len(all_mks) > len(shown_links) and new_index == len(mks) - 1
+    has_next = new_index < len(mks) - 1
+    has_more = len(state['all_mks']) > len(state['shown_links'])
     
     text = format_card(mk, new_index + 1, len(mks))
-    kb = get_card_navigation_keyboard(user_id, mk, new_index, len(mks), category, state.get('from_favorites', False), has_more)
+    kb = get_card_keyboard(user_id, mk, new_index, len(mks), has_next, has_more, category, state['from_favorites'])
     
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("new_batch_"))
 async def new_batch(callback: CallbackQuery):
-    """Новая подборка из той же категории"""
     category = callback.data.split("new_batch_", 1)[1]
     user_id = callback.from_user.id
     
@@ -363,37 +392,35 @@ async def new_batch(callback: CallbackQuery):
         return
     
     state = user_state[user_id]
-    all_mks = state.get('all_mks', [])
-    shown_links = state.get('shown_links', [])
+    all_mks = state['all_mks']
+    shown_links = state['shown_links']
     
-    # Фильтруем уже показанные
+    # Фильтруем показанные
     available = [mk for mk in all_mks if mk['link'] not in shown_links]
     
     if not available:
-        # Если все показаны, сбрасываем и начинаем заново
+        # Все показаны — сбрасываем
         available = all_mks
         shown_links = []
     
-    # Взвешенный выбор
-    selected_mks = weighted_random_choice(available, k=3)
+    selected = weighted_random_choice(available, k=3, exclude_links=shown_links)
     
-    if not selected_mks:
+    if not selected:
         await callback.answer("Больше МК нет 😔", show_alert=True)
         return
     
-    # Обновляем состояние
-    state['mks'] = selected_mks
+    state['mks'] = selected
     state['index'] = 0
-    state['shown_links'] = shown_links + [mk['link'] for mk in selected_mks]
+    state['shown_links'] = shown_links + [mk['link'] for mk in selected]
     
-    mk = selected_mks[0]
+    mk = selected[0]
     log_action(user_id, callback.from_user.username, "view", category, mk['link'])
     
-    # Проверяем, есть ли ещё
+    has_next = len(selected) > 1
     has_more = len(all_mks) > len(state['shown_links'])
     
-    text = format_card(mk, 1, len(selected_mks))
-    kb = get_card_navigation_keyboard(user_id, mk, 0, len(selected_mks), category, False, has_more)
+    text = format_card(mk, 1, len(selected))
+    kb = get_card_keyboard(user_id, mk, 0, len(selected), has_next, has_more, category, False)
     
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     await callback.answer()
@@ -408,10 +435,11 @@ async def add_to_favorites(callback: CallbackQuery):
         # Обновляем клавиатуру
         if callback.from_user.id in user_state:
             state = user_state[callback.from_user.id]
-            has_more = len(state.get('all_mks', [])) > len(state.get('shown_links', []))
-            kb = get_card_navigation_keyboard(
-                callback.from_user.id, mk, state['index'], len(state['mks']), 
-                state['category'], state.get('from_favorites', False), has_more
+            has_next = state['index'] < len(state['mks']) - 1
+            has_more = len(state['all_mks']) > len(state['shown_links'])
+            kb = get_card_keyboard(
+                callback.from_user.id, mk, state['index'], len(state['mks']),
+                has_next, has_more, state['category'], state['from_favorites']
             )
             await callback.message.edit_reply_markup(reply_markup=kb)
     else:
@@ -424,17 +452,18 @@ async def remove_from_favorites(callback: CallbackQuery):
     if remove_favorite(callback.from_user.id, link):
         log_action(callback.from_user.id, callback.from_user.username, "favorite_remove", mk['category'] if mk else "", link)
         await callback.answer("💔 Удалено из избранного", show_alert=False)
-        # Если мы в списке избранного — обновляем весь список
+        # Если в избранном — обновляем список
         if callback.from_user.id in user_state and user_state[callback.from_user.id].get('from_favorites'):
             await show_favorites_list(callback)
         else:
-            # Иначе просто обновляем кнопку на карточке
+            # Иначе обновляем кнопку на карточке
             if callback.from_user.id in user_state:
                 state = user_state[callback.from_user.id]
-                has_more = len(state.get('all_mks', [])) > len(state.get('shown_links', []))
-                kb = get_card_navigation_keyboard(
-                    callback.from_user.id, mk, state['index'], len(state['mks']), 
-                    state['category'], state.get('from_favorites', False), has_more
+                has_next = state['index'] < len(state['mks']) - 1
+                has_more = len(state['all_mks']) > len(state['shown_links'])
+                kb = get_card_keyboard(
+                    callback.from_user.id, mk, state['index'], len(state['mks']),
+                    has_next, has_more, state['category'], state['from_favorites']
                 )
                 await callback.message.edit_reply_markup(reply_markup=kb)
     else:
@@ -454,7 +483,7 @@ async def show_favorites_list(callback: CallbackQuery):
             "Нажимайте «❤️ В избранное» под карточками МК, чтобы сохранять понравившиеся.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 В меню", callback_data="start")]
+                [InlineKeyboardButton(text="📋 В главное меню", callback_data="start")]
             ])
         )
         return
@@ -468,26 +497,42 @@ async def show_favorites_list(callback: CallbackQuery):
             "Сохранённые МК больше не доступны в базе.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 В меню", callback_data="start")]
+                [InlineKeyboardButton(text="📋 В главное меню", callback_data="start")]
             ])
         )
         return
     
-    # Показываем первую карточку из избранного
-    user_state[callback.from_user.id] = {
-        'category': 'favorites',
-        'index': 0,
-        'mks': favorites_mks,
-        'all_mks': favorites_mks,
-        'from_favorites': True,
-        'shown_links': [favorites_mks[0]['link']]
-    }
+    # Компактный список избранного
+    parts = ["<b>❤️ Ваше избранное:</b>\n"]
+    buttons = []
     
-    mk = favorites_mks[0]
-    text = format_card(mk, 1, len(favorites_mks))
-    kb = get_card_navigation_keyboard(callback.from_user.id, mk, 0, len(favorites_mks), 'favorites', True, False)
+    for i, mk in enumerate(favorites_mks, 1):
+        parts.append(f"<b>{i}. {mk['name']}</b>")
+        if mk.get('category'):
+            parts.append(f"   Категория: {mk['category']}")
+        if mk.get('link'):
+            parts.append(f"   🔗 <a href='{mk['link']}'>Ссылка</a>")
+        parts.append("")
+        
+        # Кнопка удаления для каждого МК
+        buttons.append([InlineKeyboardButton(text=f"🗑 Удалить #{i}", callback_data=f"fav_remove_{mk['link']}")])
     
-    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    # Кнопки управления
+    buttons.append([InlineKeyboardButton(text="🗑 Очистить всё избранное", callback_data="clear_fav")])
+    buttons.append([InlineKeyboardButton(text="📋 В главное меню", callback_data="start")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await callback.message.answer("\n".join(parts), reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+
+@router.callback_query(F.data == "clear_fav")
+async def clear_favorites_handler(callback: CallbackQuery):
+    if clear_favorites(callback.from_user.id):
+        log_action(callback.from_user.id, callback.from_user.username, "favorites_clear")
+        await callback.answer("🗑 Избранное очищено!", show_alert=True)
+        await show_favorites_list(callback)
+    else:
+        await callback.answer("Избранное уже пусто", show_alert=True)
 
 @router.callback_query(F.data == "random")
 @router.message(Command("random"))
@@ -501,24 +546,15 @@ async def random_mk(target):
             await target.answer(text, parse_mode="HTML")
         return
     
-    # Взвешенный случайный выбор
     mk = weighted_random_choice(data, k=1)[0]
     log_action(target.from_user.id, target.from_user.username, "random", mk['category'], mk['link'])
     
-    user_state[target.from_user.id] = {
-        'category': 'random',
-        'index': 0,
-        'mks': [mk],
-        'all_mks': [mk],
-        'from_favorites': False,
-        'shown_links': [mk['link']]
-    }
-    
     text = "<b>🎲 Случайный МК:</b>\n\n" + format_card(mk, 1, 1)
-    kb = get_card_navigation_keyboard(target.from_user.id, mk, 0, 1, 'random', False, False)
     
-    # Добавляем кнопку "Ещё случайный"
-    kb.inline_keyboard.insert(-1, [InlineKeyboardButton(text="🎲 Ещё случайный", callback_data="random")])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Ещё случайный", callback_data="random")],
+        [InlineKeyboardButton(text="📋 В главное меню", callback_data="start")]
+    ])
     
     if isinstance(target, CallbackQuery):
         await target.message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
