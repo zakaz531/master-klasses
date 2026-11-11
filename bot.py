@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-import os, json, random, csv, urllib.request, time
+import os, json, random, csv, urllib.request
 from datetime import datetime
-import gspread
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart, Command
@@ -11,8 +10,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SHEET_CSV_URL = os.getenv("SHEET_CSV_URL")
-ANALYTICS_SPREADSHEET_ID = os.getenv("ANALYTICS_SPREADSHEET_ID")
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
+ANALYTICS_FILE = "analytics.json"
 FAVORITES_FILE = "favorites.json"
 
 session = AiohttpSession()
@@ -21,70 +19,29 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# Google Sheets для аналитики
-gc = None
-sheet = None
-if GOOGLE_CREDENTIALS and ANALYTICS_SPREADSHEET_ID:
-    try:
-        credentials_dict = json.loads(GOOGLE_CREDENTIALS)
-        gc = gspread.service_account_from_dict(credentials_dict)
-        sheet = gc.open_by_key(ANALYTICS_SPREADSHEET_ID).sheet1
-        print("✅ Google Sheets подключен для аналитики!")
-    except Exception as e:
-        print(f"⚠️ Ошибка подключения к Google Sheets: {e}")
+# Хранилище состояния пользователей (позиция в списке МК)
+user_state = {}
 
-# Сессии пользователей (в памяти)
-user_sessions = {}
-
-# ================= АНАЛИТИКА =================
-def get_session_info(user_id):
-    now = time.time()
-    if user_id in user_sessions:
-        sess = user_sessions[user_id]
-        if now - sess['last_activity'] > 1800:
-            sess['session_id'] = f"sess_{user_id}_{int(now)}"
-            sess['start_time'] = now
-        sess['last_activity'] = now
-    else:
-        sess = {
-            'session_id': f"sess_{user_id}_{int(now)}",
-            'start_time': now,
-            'last_activity': now
-        }
-        user_sessions[user_id] = sess
-    return sess
-
-def log_to_sheet(user_id, username, action, category="", mk_id=""):
-    if not sheet:
-        return
-    sess = get_session_info(user_id)
-    duration = int(time.time() - sess['start_time'])
-    funnel_map = {
-        'start': '1_start',
-        'category': '2_category',
-        'view': '3_view',
-        'link_click': '4_click',
-        'random': 'random',
-        'favorite_add': 'favorite',
-        'favorite_remove': 'favorite',
-        'favorites_view': 'favorite'
+# ================= АНАЛИТИКА (локальная, пока gspread не работает) =================
+def log_action(user_id, username, action, category="", mk_id=""):
+    record = {
+        "time": datetime.now().isoformat(),
+        "user_id": user_id,
+        "username": username,
+        "action": action,
+        "category": category,
+        "mk_id": mk_id
     }
-    funnel_step = funnel_map.get(action, action)
-    row = [
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        str(user_id),
-        username or "",
-        action,
-        category,
-        mk_id,
-        sess['session_id'],
-        duration,
-        funnel_step
-    ]
-    try:
-        sheet.append_row(row, value_input_option="USER_ENTERED")
-    except Exception as e:
-        print(f"⚠️ Ошибка записи в Google Sheets: {e}")
+    records = []
+    if os.path.exists(ANALYTICS_FILE):
+        try:
+            with open(ANALYTICS_FILE, 'r', encoding='utf-8') as f:
+                records = json.load(f)
+        except:
+            records = []
+    records.append(record)
+    with open(ANALYTICS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
 
 # ================= ИЗБРАННОЕ =================
 def load_favorites():
@@ -122,6 +79,9 @@ def get_user_favorites(user_id):
     favorites = load_favorites()
     return favorites.get(str(user_id), [])
 
+def is_favorite(user_id, mk_link):
+    return mk_link in get_user_favorites(user_id)
+
 # ================= ДАННЫЕ МК =================
 def load_mk_data():
     try:
@@ -131,7 +91,6 @@ def load_mk_data():
         first_line = csv_data.split('\n')[0]
         delimiter = ';' if ';' in first_line else ','
         reader = csv.DictReader(csv_data.splitlines(), delimiter=delimiter)
-        print(f"🔍 DEBUG: Заголовки таблицы: {reader.fieldnames}")
         data = []
         for row in reader:
             try:
@@ -156,7 +115,6 @@ def load_mk_data():
                 })
             except:
                 continue
-        print(f"✅ DEBUG: Загружено {len(data)} мастер-классов")
         return data
     except Exception as e:
         print(f"❌ Ошибка загрузки таблицы: {e}")
@@ -173,9 +131,10 @@ def get_mk_by_link(link):
             return mk
     return None
 
-def format_card(mk, number=1):
+def format_card(mk, number=1, total=1):
     card = []
-    card.append(f"<b>{number}. {mk['name']}</b>")
+    card.append(f"<b>{number} из {total}</b>")
+    card.append(f"<b>{mk['name']}</b>")
     card.append(f"Категория: {mk['category']}")
     card.append("")
     if mk.get('metro'):
@@ -234,38 +193,39 @@ def get_main_keyboard():
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_card_keyboard(mk, user_id):
-    favorites = get_user_favorites(user_id)
-    is_fav = mk['link'] in favorites
-    fav_text = "💔 Убрать из избранного" if is_fav else "❤️ В избранное"
-    fav_action = f"fav_remove_{mk['link']}" if is_fav else f"fav_add_{mk['link']}"
+def get_card_navigation_keyboard(user_id, mk, current_index, total_count, category, is_from_favorites=False):
+    """Клавиатура для навигации по карточкам"""
+    fav_status = is_favorite(user_id, mk['link'])
+    fav_text = "💔 Убрать" if fav_status else "❤️ В избранное"
+    fav_action = f"fav_remove_{mk['link']}" if fav_status else f"fav_add_{mk['link']}"
     
-    buttons = [
-        [InlineKeyboardButton(text=fav_text, callback_data=fav_action)],
-        [InlineKeyboardButton(text="📋 В меню", callback_data="start")],
-    ]
+    buttons = []
+    
+    # Кнопки навигации
+    nav_row = []
+    if current_index > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"nav_{category}_{current_index - 1}"))
+    if current_index < total_count - 1:
+        nav_row.append(InlineKeyboardButton(text="▶️ Вперёд", callback_data=f"nav_{category}_{current_index + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    
+    # Кнопка избранного
+    buttons.append([InlineKeyboardButton(text=fav_text, callback_data=fav_action)])
+    
+    # Кнопка "В меню"
+    if is_from_favorites:
+        buttons.append([InlineKeyboardButton(text="📋 К избранному", callback_data="show_fav")])
+    else:
+        buttons.append([InlineKeyboardButton(text="📋 В меню", callback_data="start")])
+    
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-# Прогресс пользователя: какие МК уже показаны в каждой категории
-user_progress = {}
-
-def get_user_progress(user_id, category):
-    key = f"{user_id}_{category}"
-    if key not in user_progress:
-        user_progress[key] = []
-    return user_progress[key]
-
-def add_to_progress(user_id, category, links):
-    key = f"{user_id}_{category}"
-    if key not in user_progress:
-        user_progress[key] = []
-    user_progress[key].extend(links)
 
 # ================= ОБРАБОТЧИКИ =================
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    log_to_sheet(message.from_user.id, message.from_user.username, "start")
+    log_action(message.from_user.id, message.from_user.username, "start")
     await message.answer(
         "👋 <b>Привет!</b>\n\n"
         "Я помогу подобрать мастер-класс в Москве.\n\n"
@@ -277,17 +237,10 @@ async def cmd_start(message: Message):
 @router.callback_query(F.data.startswith("cat_"))
 async def show_category(callback: CallbackQuery):
     category = callback.data.split("_", 1)[1]
-    log_to_sheet(callback.from_user.id, callback.from_user.username, "category", category)
+    log_action(callback.from_user.id, callback.from_user.username, "category", category)
     
-    shown_links = get_user_progress(callback.from_user.id, category)
-    all_mks = get_mk_by_category(category)
-    available = [mk for mk in all_mks if mk['link'] not in shown_links]
-    
-    if not available:
-        user_progress[f"{callback.from_user.id}_{category}"] = []
-        available = all_mks
-    
-    if not available:
+    mks = get_mk_by_category(category)
+    if not mks:
         await callback.message.answer(
             f"😔 В категории «{category}» пока нет МК.\n\n"
             f"Попробуйте другую категорию или нажмите /random",
@@ -295,80 +248,66 @@ async def show_category(callback: CallbackQuery):
         )
         return
     
-    to_show = available[:3]
-    shown_links_new = [mk['link'] for mk in to_show]
-    add_to_progress(callback.from_user.id, category, shown_links_new)
+    # Сохраняем состояние пользователя
+    user_state[callback.from_user.id] = {
+        'category': category,
+        'index': 0,
+        'mks': mks,
+        'from_favorites': False
+    }
     
-    parts = [f"<b>🎯 Категория «{category}»:</b>\n"]
-    for i, mk in enumerate(to_show, 1):
-        parts.append(format_card(mk, i))
-        parts.append("─" * 40)
-        log_to_sheet(callback.from_user.id, callback.from_user.username, "view", category, mk['link'])
+    mk = mks[0]
+    log_action(callback.from_user.id, callback.from_user.username, "view", category, mk['link'])
     
-    last_mk = to_show[-1]
-    kb = get_card_keyboard(last_mk, callback.from_user.id)
+    text = format_card(mk, 1, len(mks))
+    kb = get_card_navigation_keyboard(callback.from_user.id, mk, 0, len(mks), category)
     
-    nav_buttons = []
-    if len(available) > 3:
-        nav_buttons.append([InlineKeyboardButton(text="🔄 Ещё варианты", callback_data=f"more_{category}")])
-    nav_buttons.append([
-        InlineKeyboardButton(text="🎲 Случайный", callback_data="random"),
-        InlineKeyboardButton(text="📋 В меню", callback_data="start")
-    ])
-    
-    all_buttons = kb.inline_keyboard[:-1] + nav_buttons
-    final_kb = InlineKeyboardMarkup(inline_keyboard=all_buttons)
-    
-    await callback.message.answer("\n".join(parts), reply_markup=final_kb, parse_mode="HTML", disable_web_page_preview=True)
+    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
 
-@router.callback_query(F.data.startswith("more_"))
-async def show_more(callback: CallbackQuery):
-    category = callback.data.split("_", 1)[1]
-    shown_links = get_user_progress(callback.from_user.id, category)
-    all_mks = get_mk_by_category(category)
-    available = [mk for mk in all_mks if mk['link'] not in shown_links]
+@router.callback_query(F.data.startswith("nav_"))
+async def navigate_card(callback: CallbackQuery):
+    """Навигация между карточками"""
+    data = callback.data[4:]  # убираем "nav_"
+    parts = data.rsplit("_", 1)
+    category = parts[0]
+    new_index = int(parts[1])
     
-    if not available:
-        await callback.answer("Больше МК в этой категории нет 😔", show_alert=True)
+    user_id = callback.from_user.id
+    if user_id not in user_state or user_state[user_id]['category'] != category:
+        await callback.answer("Сессия истекла, выберите категорию заново", show_alert=True)
         return
     
-    to_show = available[:3]
-    shown_links_new = [mk['link'] for mk in to_show]
-    add_to_progress(callback.from_user.id, category, shown_links_new)
+    state = user_state[user_id]
+    mks = state['mks']
     
-    parts = [f"<b>🔄 Ещё из «{category}»:</b>\n"]
-    for i, mk in enumerate(to_show, 1):
-        parts.append(format_card(mk, i))
-        parts.append("─" * 40)
-        log_to_sheet(callback.from_user.id, callback.from_user.username, "view", category, mk['link'])
+    if new_index < 0 or new_index >= len(mks):
+        await callback.answer("Больше нет карточек", show_alert=True)
+        return
     
-    last_mk = to_show[-1]
-    kb = get_card_keyboard(last_mk, callback.from_user.id)
+    mk = mks[new_index]
+    log_action(user_id, callback.from_user.username, "view", category, mk['link'])
     
-    nav_buttons = []
-    remaining = [mk for mk in all_mks if mk['link'] not in shown_links + shown_links_new]
-    if remaining:
-        nav_buttons.append([InlineKeyboardButton(text="🔄 Ещё", callback_data=f"more_{category}")])
-    nav_buttons.append([
-        InlineKeyboardButton(text="🎲 Случайный", callback_data="random"),
-        InlineKeyboardButton(text="📋 В меню", callback_data="start")
-    ])
+    text = format_card(mk, new_index + 1, len(mks))
+    kb = get_card_navigation_keyboard(user_id, mk, new_index, len(mks), category, state.get('from_favorites', False))
     
-    all_buttons = kb.inline_keyboard[:-1] + nav_buttons
-    final_kb = InlineKeyboardMarkup(inline_keyboard=all_buttons)
-    
-    await callback.message.answer("\n".join(parts), reply_markup=final_kb, parse_mode="HTML", disable_web_page_preview=True)
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("fav_add_"))
 async def add_to_favorites(callback: CallbackQuery):
     link = callback.data.split("fav_add_", 1)[1]
     mk = get_mk_by_link(link)
     if add_favorite(callback.from_user.id, link):
-        log_to_sheet(callback.from_user.id, callback.from_user.username, "favorite_add", mk['category'] if mk else "", link)
+        log_action(callback.from_user.id, callback.from_user.username, "favorite_add", mk['category'] if mk else "", link)
         await callback.answer("❤️ Добавлено в избранное!", show_alert=False)
-        if mk:
-            new_kb = get_card_keyboard(mk, callback.from_user.id)
-            await callback.message.edit_reply_markup(reply_markup=new_kb)
+        # Обновляем кнопку
+        if callback.from_user.id in user_state:
+            state = user_state[callback.from_user.id]
+            kb = get_card_navigation_keyboard(
+                callback.from_user.id, mk, state['index'], len(state['mks']), 
+                state['category'], state.get('from_favorites', False)
+            )
+            await callback.message.edit_reply_markup(reply_markup=kb)
     else:
         await callback.answer("Уже в избранном", show_alert=True)
 
@@ -377,17 +316,29 @@ async def remove_from_favorites(callback: CallbackQuery):
     link = callback.data.split("fav_remove_", 1)[1]
     mk = get_mk_by_link(link)
     if remove_favorite(callback.from_user.id, link):
-        log_to_sheet(callback.from_user.id, callback.from_user.username, "favorite_remove", mk['category'] if mk else "", link)
+        log_action(callback.from_user.id, callback.from_user.username, "favorite_remove", mk['category'] if mk else "", link)
         await callback.answer("💔 Удалено из избранного", show_alert=False)
-        if mk:
-            new_kb = get_card_keyboard(mk, callback.from_user.id)
-            await callback.message.edit_reply_markup(reply_markup=new_kb)
+        # Если мы в списке избранного — обновляем весь список
+        if callback.from_user.id in user_state and user_state[callback.from_user.id].get('from_favorites'):
+            await show_favorites_list(callback)
+        else:
+            # Иначе просто обновляем кнопку на карточке
+            if callback.from_user.id in user_state:
+                state = user_state[callback.from_user.id]
+                kb = get_card_navigation_keyboard(
+                    callback.from_user.id, mk, state['index'], len(state['mks']), 
+                    state['category'], state.get('from_favorites', False)
+                )
+                await callback.message.edit_reply_markup(reply_markup=kb)
     else:
         await callback.answer("Не найдено в избранном", show_alert=True)
 
 @router.callback_query(F.data == "show_fav")
 async def show_favorites(callback: CallbackQuery):
-    log_to_sheet(callback.from_user.id, callback.from_user.username, "favorites_view")
+    log_action(callback.from_user.id, callback.from_user.username, "favorites_view")
+    await show_favorites_list(callback)
+
+async def show_favorites_list(callback: CallbackQuery):
     favorites_links = get_user_favorites(callback.from_user.id)
     
     if not favorites_links:
@@ -415,16 +366,19 @@ async def show_favorites(callback: CallbackQuery):
         )
         return
     
-    parts = ["<b>❤️ Ваше избранное:</b>\n"]
-    for i, mk in enumerate(favorites_mks, 1):
-        parts.append(format_card(mk, i))
-        parts.append("─" * 40)
+    # Показываем первую карточку из избранного
+    user_state[callback.from_user.id] = {
+        'category': 'favorites',
+        'index': 0,
+        'mks': favorites_mks,
+        'from_favorites': True
+    }
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 В меню", callback_data="start")]
-    ])
+    mk = favorites_mks[0]
+    text = format_card(mk, 1, len(favorites_mks))
+    kb = get_card_navigation_keyboard(callback.from_user.id, mk, 0, len(favorites_mks), 'favorites', True)
     
-    await callback.message.answer("\n".join(parts), reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
 
 @router.callback_query(F.data == "random")
 @router.message(Command("random"))
@@ -439,22 +393,25 @@ async def random_mk(target):
         return
     
     mk = random.choice(data)
-    log_to_sheet(target.from_user.id, target.from_user.username, "random", mk['category'], mk['link'])
+    log_action(target.from_user.id, target.from_user.username, "random", mk['category'], mk['link'])
     
-    text = "<b>🎲 Случайный МК:</b>\n\n" + format_card(mk, 1)
-    kb = get_card_keyboard(mk, target.from_user.id)
+    user_state[target.from_user.id] = {
+        'category': 'random',
+        'index': 0,
+        'mks': [mk],
+        'from_favorites': False
+    }
     
-    nav_buttons = [
-        [InlineKeyboardButton(text="🎲 Ещё случайный", callback_data="random")],
-        [InlineKeyboardButton(text="📋 В меню", callback_data="start")]
-    ]
-    all_buttons = kb.inline_keyboard[:-1] + nav_buttons
-    final_kb = InlineKeyboardMarkup(inline_keyboard=all_buttons)
+    text = "<b>🎲 Случайный МК:</b>\n\n" + format_card(mk, 1, 1)
+    kb = get_card_navigation_keyboard(target.from_user.id, mk, 0, 1, 'random', False)
+    
+    # Добавляем кнопку "Ещё случайный"
+    kb.inline_keyboard.insert(-1, [InlineKeyboardButton(text="🎲 Ещё случайный", callback_data="random")])
     
     if isinstance(target, CallbackQuery):
-        await target.message.answer(text, reply_markup=final_kb, parse_mode="HTML", disable_web_page_preview=True)
+        await target.message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     else:
-        await target.answer(text, reply_markup=final_kb, parse_mode="HTML", disable_web_page_preview=True)
+        await target.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
 
 @router.callback_query(F.data == "start")
 async def go_start(callback: CallbackQuery):
@@ -465,28 +422,30 @@ async def go_start(callback: CallbackQuery):
 async def admin_stats(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
-    if not sheet:
-        await message.answer("📊 Google Sheets не подключен.")
+    
+    if not os.path.exists(ANALYTICS_FILE):
+        await message.answer("📊 Статистика пока пуста.")
         return
     
-    try:
-        records = sheet.get_all_records()
-    except Exception as e:
-        await message.answer(f"❌ Ошибка чтения: {e}")
-        return
+    with open(ANALYTICS_FILE, 'r', encoding='utf-8') as f:
+        try:
+            records = json.load(f)
+        except:
+            await message.answer("❌ Ошибка чтения статистики.")
+            return
     
     now = datetime.now()
     today = now.date()
     
-    today_records = [r for r in records if r.get('timestamp') and datetime.strptime(str(r['timestamp'])[:19], "%Y-%m-%d %H:%M:%S").date() == today]
-    total_users = len(set(r.get('user_id') for r in today_records if r.get('user_id')))
-    starts = len([r for r in today_records if r.get('action') == 'start'])
-    categories = len([r for r in today_records if r.get('action') == 'category'])
-    views = len([r for r in today_records if r.get('action') == 'view'])
+    today_records = [r for r in records if datetime.fromisoformat(r['time']).date() == today]
+    total_users = len(set(r['user_id'] for r in today_records))
+    starts = len([r for r in today_records if r['action'] == 'start'])
+    categories = len([r for r in today_records if r['action'] == 'category'])
+    views = len([r for r in today_records if r['action'] == 'view'])
     
     cat_counts = {}
     for r in records:
-        if r.get('action') == 'category' and r.get('category'):
+        if r['action'] == 'category' and r.get('category'):
             cat = r['category']
             cat_counts[cat] = cat_counts.get(cat, 0) + 1
     top_cats = sorted(cat_counts.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -506,8 +465,7 @@ async def admin_stats(message: Message):
 
 # ================= ЗАПУСК =================
 async def main():
-    print("✅ Бот успешно запущен с аналитикой в Google Sheets!")
-    print(f"📊 Таблица аналитики: {ANALYTICS_SPREADSHEET_ID}")
+    print("✅ Бот успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
