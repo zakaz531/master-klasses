@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-import os, json, random, csv, urllib.request
+import os, json, random, csv, urllib.request, time
 from datetime import datetime
+import gspread
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart, Command
@@ -10,8 +11,10 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SHEET_CSV_URL = os.getenv("SHEET_CSV_URL")
-ANALYTICS_FILE = "analytics.json"
+ANALYTICS_SPREADSHEET_ID = os.getenv("ANALYTICS_SPREADSHEET_ID")
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 FAVORITES_FILE = "favorites.json"
+USER_STATS_FILE = "user_stats.json"
 
 session = AiohttpSession()
 bot = Bot(token=BOT_TOKEN, session=session)
@@ -19,38 +22,111 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# Состояние пользователей
-user_state = {}
+# ================= GOOGLE SHEETS ИНИЦИАЛИЗАЦИЯ =================
+gc = None
+sheet = None
+if GOOGLE_CREDENTIALS and ANALYTICS_SPREADSHEET_ID:
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        gc = gspread.service_account_from_dict(creds_dict)
+        sheet = gc.open_by_key(ANALYTICS_SPREADSHEET_ID).sheet1
+        print("✅ Google Sheets подключен для аналитики!")
+    except Exception as e:
+        print(f"⚠️ Ошибка подключения к Google Sheets: {e}")
 
-# ================= АНАЛИТИКА =================
-def log_action(user_id, username, action, category="", mk_id=""):
-    record = {
-        "time": datetime.now().isoformat(),
-        "user_id": user_id,
-        "username": username,
-        "action": action,
-        "category": category,
-        "mk_id": mk_id
-    }
-    records = []
-    if os.path.exists(ANALYTICS_FILE):
+# ================= СОСТОЯНИЯ И СТАТИСТИКА =================
+user_state = {}
+user_sessions = {}
+
+def get_user_stats(user_id):
+    """Отслеживает is_new_user и visit_count"""
+    stats = {}
+    if os.path.exists(USER_STATS_FILE):
         try:
-            with open(ANALYTICS_FILE, 'r', encoding='utf-8') as f:
-                records = json.load(f)
+            with open(USER_STATS_FILE, 'r', encoding='utf-8') as f:
+                stats = json.load(f)
         except:
-            records = []
-    records.append(record)
-    with open(ANALYTICS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
+            stats = {}
+    
+    user_str = str(user_id)
+    is_new = user_str not in stats
+    if is_new:
+        stats[user_str] = {"visit_count": 1}
+    else:
+        stats[user_str]["visit_count"] += 1
+    
+    with open(USER_STATS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+        
+    return is_new, stats[user_str]["visit_count"]
+
+def get_session_info(user_id):
+    """Управляет сессиями (30 минут неактивности = новая сессия)"""
+    now = time.time()
+    if user_id in user_sessions:
+        sess = user_sessions[user_id]
+        if now - sess['last_activity'] > 1800: # 30 минут
+            sess['session_id'] = f"sess_{user_id}_{int(now)}"
+            sess['start_time'] = now
+        sess['last_activity'] = now
+    else:
+        sess = {
+            'session_id': f"sess_{user_id}_{int(now)}",
+            'start_time': now,
+            'last_activity': now
+        }
+        user_sessions[user_id] = sess
+    return sess
+
+def log_to_sheet(user_id, username, action, category="", mk_id=""):
+    """Записывает строку в Google Таблицу"""
+    if not sheet:
+        return
+    
+    sess = get_session_info(user_id)
+    duration = int(time.time() - sess['start_time'])
+    is_new, visit_count = get_user_stats(user_id)
+    
+    # Маппинг действий в шаги воронки
+    funnel_map = {
+        'start': '1_start',
+        'category': '2_category',
+        'view': '3_view',
+        'link_click': '4_click',
+        'random': 'random',
+        'favorite_add': 'favorite',
+        'favorite_remove': 'favorite',
+        'favorites_view': 'favorite',
+        'favorites_clear': 'favorite'
+    }
+    funnel_step = funnel_map.get(action, action)
+    
+    # Формируем строку ровно под ваши 11 столбцов
+    row = [
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"), # timestamp
+        str(user_id),                                  # user_id
+        username or "",                                # username
+        action,                                        # action
+        category,                                      # category
+        mk_id,                                         # mk_id
+        sess['session_id'],                            # session_id
+        duration,                                      # session_duration
+        "TRUE" if is_new else "FALSE",                 # is_new_user
+        funnel_step,                                   # funnel_step
+        visit_count                                    # visit_count
+    ]
+    
+    try:
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        print(f"⚠️ Ошибка записи в Google Sheets: {e}")
 
 # ================= ИЗБРАННОЕ =================
 def load_favorites():
     if os.path.exists(FAVORITES_FILE):
         try:
-            with open(FAVORITES_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            return {}
+            with open(FAVORITES_FILE, 'r', encoding='utf-8') as f: return json.load(f)
+        except: return {}
     return {}
 
 def save_favorites(favorites):
@@ -59,8 +135,7 @@ def save_favorites(favorites):
 
 def add_favorite(user_id, mk_link):
     favorites = load_favorites()
-    if str(user_id) not in favorites:
-        favorites[str(user_id)] = []
+    if str(user_id) not in favorites: favorites[str(user_id)] = []
     if mk_link not in favorites[str(user_id)]:
         favorites[str(user_id)].append(mk_link)
         save_favorites(favorites)
@@ -84,8 +159,7 @@ def clear_favorites(user_id):
     return False
 
 def get_user_favorites(user_id):
-    favorites = load_favorites()
-    return favorites.get(str(user_id), [])
+    return load_favorites().get(str(user_id), [])
 
 def is_favorite(user_id, mk_link):
     return mk_link in get_user_favorites(user_id)
@@ -105,14 +179,11 @@ def load_mk_data():
                 clean_row = {k.strip().lower(): (v.strip() if v else "") for k, v in row.items() if k}
                 name = clean_row.get('name', '')
                 category = clean_row.get('category', '')
-                if not name or not category:
-                    continue
+                if not name or not category: continue
                 
                 priority = clean_row.get('priority', '1')
-                try:
-                    priority = int(priority)
-                except:
-                    priority = 1
+                try: priority = int(priority)
+                except: priority = 1
                 
                 data.append({
                     "link": clean_row.get('link', '') or clean_row.get('tglink', ''),
@@ -127,102 +198,71 @@ def load_mk_data():
                     "participants": clean_row.get('participants', ''),
                     "periodicity": clean_row.get('periodicity', ''),
                     "public_page": clean_row.get('public_page', '') or clean_row.get('сайт', ''),
+                    "preposition": clean_row.get('preposition', ''),
                     "priority": priority
                 })
-            except:
-                continue
+            except: continue
         return data
     except Exception as e:
         print(f"❌ Ошибка загрузки таблицы: {e}")
         return []
 
 def get_mk_by_category(category):
-    data = load_mk_data()
-    return [item for item in data if item["category"].lower() == category.lower()]
+    return [item for item in load_mk_data() if item["category"].lower() == category.lower()]
 
 def get_mk_by_link(link):
-    data = load_mk_data()
-    for mk in data:
-        if mk['link'] == link:
-            return mk
+    for mk in load_mk_data():
+        if mk['link'] == link: return mk
     return None
 
 def weighted_random_choice(items, k=3, exclude_links=None):
-    """Взвешенный случайный выбор с учётом приоритета"""
-    if not items:
-        return []
+    if not items: return []
     exclude_links = exclude_links or []
     available = [item for item in items if item['link'] not in exclude_links]
-    if not available:
-        return []
+    if not available: return []
     
     pool = []
     for item in available:
-        priority = item.get('priority', 1)
-        pool.extend([item] * priority)
+        pool.extend([item] * item.get('priority', 1))
     
-    selected = []
-    used_links = set()
-    
+    selected, used_links = [], set()
     for _ in range(min(k, len(available))):
         available_pool = [item for item in pool if item['link'] not in used_links]
-        if not available_pool:
-            break
+        if not available_pool: break
         chosen = random.choice(available_pool)
         selected.append(chosen)
         used_links.add(chosen['link'])
-    
     return selected
 
 def format_card(mk, number=1, total=1):
-    card = []
-    card.append(f"<b>{number} из {total}</b>")
-    card.append(f"<b>{mk['name']}</b>")
-    card.append(f"Категория: {mk['category']}")
+    card = [f"<b>{number} из {total}</b>", f"<b>{mk['name']}</b>", f"Категория: {mk['category']}", ""]
+    if mk.get('preposition'):
+        card.extend([f"💬 <i>{mk['preposition']}</i>", ""])
+    if mk.get('metro'): card.append(f"🚇 <b>Метро:</b> {mk['metro']}")
+    if mk.get('price'): card.append(f"💰 <b>Цена:</b> {mk['price']}")
+    if mk.get('participants'): card.append(f"👥 <b>Участников:</b> до {mk['participants']} чел.")
+    if mk.get('periodicity'): card.append(f"📅 <b>Периодичность:</b> {mk['periodicity']}")
     card.append("")
-    if mk.get('metro'):
-        card.append(f"🚇 <b>Метро:</b> {mk['metro']}")
-    if mk.get('price'):
-        card.append(f"💰 <b>Цена:</b> {mk['price']}")
-    if mk.get('participants'):
-        card.append(f"👥 <b>Участников:</b> до {mk['participants']} чел.")
-    if mk.get('periodicity'):
-        card.append(f"📅 <b>Периодичность:</b> {mk['periodicity']}")
-    card.append("")
-    if mk.get('feature'):
-        card.append(f"✨ <b>Фишка:</b> {mk['feature']}")
-    if mk.get('advantages'):
-        card.append(f"✅ <b>Плюсы:</b> {mk['advantages']}")
-    if mk.get('disadvantages'):
-        card.append(f"⚠️ <b>Минусы:</b> {mk['disadvantages']}")
-    if mk.get('best_reason'):
-        card.append(f"💡 <b>Идеально для:</b> {mk['best_reason']}")
-    card.append("")
-    card.append("⚠️ <i>Проверьте актуальность перед записью!</i>")
+    if mk.get('feature'): card.append(f"✨ <b>Фишка:</b> {mk['feature']}")
+    if mk.get('advantages'): card.append(f"✅ <b>Плюсы:</b> {mk['advantages']}")
+    if mk.get('disadvantages'): card.append(f"⚠️ <b>Минусы:</b> {mk['disadvantages']}")
+    if mk.get('best_reason'): card.append(f"💡 <b>Идеально для:</b> {mk['best_reason']}")
+    card.extend(["", "⚠️ <i>Проверьте актуальность перед записью!</i>"])
+    
     links = []
-    if mk.get('link'):
-        links.append(f"🔗 <a href='{mk['link']}'>Пост в канале</a>")
+    if mk.get('link'): links.append(f"🔗 <a href='{mk['link']}'>Пост в канале</a>")
     if mk.get('public_page') and mk['public_page'] not in ['#', '', 'нет ссылки']:
         links.append(f"🌐 <a href='{mk['public_page']}'>Сайт</a>")
-    if links:
-        card.append(" | ".join(links))
+    if links: card.append(" | ".join(links))
     return "\n".join(card)
 
 # ================= МЕНЮ =================
 def get_main_keyboard():
     categories = [
-        ("🍳 Кулинария", "Кулинария"),
-        ("🎨 Арт", "Арт"),
-        ("🧶 Рукоделие", "Рукоделие"),
-        ("🏺 Керамика", "Керамика"),
-        ("💎 Ювелирка", "Ювелирка"),
-        ("🌸 Флористика", "Флористика"),
-        ("🎭 Необычное", "Необычное"),
-        ("💃 Танцы", "Танцы"),
-        ("🎵 Музыка", "Музыка"),
-        ("📸 Фото", "Фото"),
-        ("👶 Детский", "Детский"),
-        ("📋 Разное", "Разное"),
+        ("🍳 Кулинария", "Кулинария"), ("🎨 Арт", "Арт"), ("🧶 Рукоделие", "Рукоделие"),
+        ("🏺 Керамика", "Керамика"), ("💎 Ювелирка", "Ювелирка"), ("🌸 Флористика", "Флористика"),
+        ("🎭 Необычное", "Необычное"), ("💃 Танцы", "Танцы"), ("🎵 Музыка", "Музыка"),
+        ("📸 Фото", "Фото"), ("👶 Детский", "Детский"), ("📋 Разное", "Разное"),
     ]
     buttons = []
     for i in range(0, len(categories), 2):
@@ -230,81 +270,43 @@ def get_main_keyboard():
         if i + 1 < len(categories):
             row.append(InlineKeyboardButton(text=categories[i+1][0], callback_data=f"cat_{categories[i+1][1]}"))
         buttons.append(row)
-    buttons.append([
-        InlineKeyboardButton(text="🎲 Случайный", callback_data="random"),
-        InlineKeyboardButton(text="❤️ Избранное", callback_data="show_fav")
-    ])
-    buttons.append([
-        InlineKeyboardButton(text="❓ Помощь", callback_data="help")
-    ])
+    buttons.append([InlineKeyboardButton(text="🎲 Случайный", callback_data="random"), InlineKeyboardButton(text="❤️ Избранное", callback_data="show_fav")])
+    buttons.append([InlineKeyboardButton(text="❓ Помощь", callback_data="help")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_card_keyboard(user_id, mk, current_index, total_in_batch, has_next_in_batch, has_more_in_category, category, from_favorites=False):
-    """Клавиатура для карточки"""
+def get_card_keyboard(user_id, mk, current_index, total_in_batch, has_next, has_more, category, from_fav=False):
     fav_status = is_favorite(user_id, mk['link'])
     fav_text = "💔 Убрать из избранного" if fav_status else "❤️ В избранное"
     fav_action = f"fav_remove_{mk['link']}" if fav_status else f"fav_add_{mk['link']}"
     
     buttons = []
-    
-    # Навигация
     nav_row = []
-    if current_index > 0:
-        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"nav_{category}_{current_index - 1}"))
-    if has_next_in_batch:
-        nav_row.append(InlineKeyboardButton(text="▶️ Вперёд", callback_data=f"nav_{category}_{current_index + 1}"))
-    elif has_more_in_category:
-        nav_row.append(InlineKeyboardButton(text="🔄 Ещё подборку", callback_data=f"new_batch_{category}"))
-    if nav_row:
-        buttons.append(nav_row)
+    if current_index > 0: nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"nav_{category}_{current_index - 1}"))
+    if has_next: nav_row.append(InlineKeyboardButton(text="▶️ Вперёд", callback_data=f"nav_{category}_{current_index + 1}"))
+    elif has_more: nav_row.append(InlineKeyboardButton(text="🔄 Ещё подборку", callback_data=f"new_batch_{category}"))
+    if nav_row: buttons.append(nav_row)
     
-    # Избранное
     buttons.append([InlineKeyboardButton(text=fav_text, callback_data=fav_action)])
-    
-    # Меню
-    if from_favorites:
-        buttons.append([InlineKeyboardButton(text="📋 К списку избранного", callback_data="show_fav")])
-    else:
-        buttons.append([InlineKeyboardButton(text="📋 В главное меню", callback_data="start")])
-    
+    buttons.append([InlineKeyboardButton(text="📋 К списку избранного" if from_fav else "📋 В главное меню", callback_data="show_fav" if from_fav else "start")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ================= ОБРАБОТЧИКИ =================
-
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    log_action(message.from_user.id, message.from_user.username, "start")
-    await message.answer(
-        "👋 <b>Привет!</b>\n\n"
-        "Я помогу подобрать мастер-класс в Москве.\n\n"
-        "<b>Выберите категорию:</b>",
-        reply_markup=get_main_keyboard(),
-        parse_mode="HTML"
-    )
+    log_to_sheet(message.from_user.id, message.from_user.username, "start")
+    await message.answer("👋 <b>Привет!</b>\n\nЯ помогу подобрать мастер-класс в Москве.\n\n<b>Выберите категорию:</b>", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @router.message(Command("help"))
 @router.callback_query(F.data == "help")
 async def cmd_help(target):
-    help_text = (
-        "📖 <b>Как пользоваться ботом:</b>\n\n"
-        "🍳 <b>Выбор категории</b> — нажмите на кнопку с нужной категорией\n\n"
-        "🎯 <b>Просмотр МК</b> — бот покажет 3 мастер-класса из категории. "
-        "Используйте кнопки ◀️ Назад и ▶️ Вперёд для навигации\n\n"
-        "🔄 <b>Ещё подборку</b> — когда дойдёте до последнего МК, нажмите "
-        "«🔄 Ещё подборку» для новой тройки МК\n\n"
-        "❤️ <b>Избранное</b> — нажмите «❤️ В избранное» под карточкой, "
-        "чтобы сохранить МК. Смотреть избранное можно в главном меню\n\n"
-        "💔 <b>Удалить из избранного</b> — нажмите «💔 Убрать из избранного» "
-        "или зайдите в раздел «❤️ Избранное» и удалите ненужное\n\n"
-        "🎲 <b>Случайный МК</b> — кнопка в главном меню покажет случайный мастер-класс\n\n"
-        "📊 <b>Статистика</b> — команда /stats (только для админа)\n\n"
-        "⚠️ <i>Проверяйте актуальность МК перед записью!</i>"
-    )
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 В главное меню", callback_data="start")]
-    ])
-    
+    help_text = ("📖 <b>Как пользоваться ботом:</b>\n\n"
+        "🍳 <b>Выбор категории</b> — нажмите на кнопку с нужной категорией\n"
+        "🎯 <b>Просмотр МК</b> — бот покажет 3 мастер-класса. Используйте ◀️ Назад и ▶️ Вперёд\n"
+        "🔄 <b>Ещё подборку</b> — на последней карточке нажмите для новой тройки МК\n"
+        "❤️ <b>Избранное</b> — сохраняйте понравившиеся МК и управляйте ими в главном меню\n"
+        "🎲 <b>Случайный МК</b> — покажет случайный мастер-класс с повышенным приоритетом\n"
+        "⚠️ <i>Проверяйте актуальность МК перед записью!</i>")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 В главное меню", callback_data="start")]])
     if isinstance(target, CallbackQuery):
         await target.message.answer(help_text, reply_markup=kb, parse_mode="HTML")
         await target.answer()
@@ -314,115 +316,67 @@ async def cmd_help(target):
 @router.callback_query(F.data.startswith("cat_"))
 async def show_category(callback: CallbackQuery):
     category = callback.data.split("_", 1)[1]
-    log_action(callback.from_user.id, callback.from_user.username, "category", category)
-    
+    log_to_sheet(callback.from_user.id, callback.from_user.username, "category", category)
     all_mks = get_mk_by_category(category)
     if not all_mks:
-        await callback.message.answer(
-            f"😔 В категории «{category}» пока нет МК.\n\n"
-            f"Попробуйте другую категорию или нажмите /random",
-            parse_mode="HTML"
-        )
+        await callback.message.answer(f"😔 В категории «{category}» пока нет МК.\n\nПопробуйте другую или нажмите /random", parse_mode="HTML")
         return
     
-    # Взвешенный выбор 3 МК
     selected = weighted_random_choice(all_mks, k=3)
-    
-    user_state[callback.from_user.id] = {
-        'category': category,
-        'index': 0,
-        'mks': selected,
-        'all_mks': all_mks,
-        'shown_links': [mk['link'] for mk in selected],
-        'from_favorites': False
-    }
+    user_state[callback.from_user.id] = {'category': category, 'index': 0, 'mks': selected, 'all_mks': all_mks, 'shown_links': [mk['link'] for mk in selected], 'from_favorites': False}
     
     mk = selected[0]
-    log_action(callback.from_user.id, callback.from_user.username, "view", category, mk['link'])
-    
+    log_to_sheet(callback.from_user.id, callback.from_user.username, "view", category, mk['link'])
     has_next = len(selected) > 1
     has_more = len(all_mks) > len(selected)
     
-    text = format_card(mk, 1, len(selected))
-    kb = get_card_keyboard(callback.from_user.id, mk, 0, len(selected), has_next, has_more, category, False)
-    
-    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    await callback.message.answer(format_card(mk, 1, len(selected)), reply_markup=get_card_keyboard(callback.from_user.id, mk, 0, len(selected), has_next, has_more, category, False), parse_mode="HTML", disable_web_page_preview=True)
 
 @router.callback_query(F.data.startswith("nav_"))
 async def navigate_card(callback: CallbackQuery):
     data = callback.data[4:]
     parts = data.rsplit("_", 1)
-    category = parts[0]
-    new_index = int(parts[1])
+    category, new_index = parts[0], int(parts[1])
     
-    user_id = callback.from_user.id
-    if user_id not in user_state or user_state[user_id]['category'] != category:
-        await callback.answer("Сессия истекла, выберите категорию заново", show_alert=True)
-        return
+    if callback.from_user.id not in user_state or user_state[callback.from_user.id]['category'] != category:
+        return await callback.answer("Сессия истекла", show_alert=True)
     
-    state = user_state[user_id]
-    mks = state['mks']
+    state = user_state[callback.from_user.id]
+    if new_index < 0 or new_index >= len(state['mks']):
+        return await callback.answer("Больше нет карточек", show_alert=True)
     
-    if new_index < 0 or new_index >= len(mks):
-        await callback.answer("Больше нет карточек", show_alert=True)
-        return
-    
-    # Обновляем индекс
     state['index'] = new_index
+    mk = state['mks'][new_index]
+    log_to_sheet(callback.from_user.id, callback.from_user.username, "view", category, mk['link'])
     
-    mk = mks[new_index]
-    log_action(user_id, callback.from_user.username, "view", category, mk['link'])
-    
-    has_next = new_index < len(mks) - 1
+    has_next = new_index < len(state['mks']) - 1
     has_more = len(state['all_mks']) > len(state['shown_links'])
     
-    text = format_card(mk, new_index + 1, len(mks))
-    kb = get_card_keyboard(user_id, mk, new_index, len(mks), has_next, has_more, category, state['from_favorites'])
-    
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    await callback.message.edit_text(format_card(mk, new_index + 1, len(state['mks'])), reply_markup=get_card_keyboard(callback.from_user.id, mk, new_index, len(state['mks']), has_next, has_more, category, state['from_favorites']), parse_mode="HTML", disable_web_page_preview=True)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("new_batch_"))
 async def new_batch(callback: CallbackQuery):
     category = callback.data.split("new_batch_", 1)[1]
-    user_id = callback.from_user.id
+    if callback.from_user.id not in user_state: return await callback.answer("Сессия истекла", show_alert=True)
     
-    if user_id not in user_state:
-        await callback.answer("Сессия истекла", show_alert=True)
-        return
-    
-    state = user_state[user_id]
-    all_mks = state['all_mks']
-    shown_links = state['shown_links']
-    
-    # Фильтруем показанные
-    available = [mk for mk in all_mks if mk['link'] not in shown_links]
-    
+    state = user_state[callback.from_user.id]
+    available = [mk for mk in state['all_mks'] if mk['link'] not in state['shown_links']]
     if not available:
-        # Все показаны — сбрасываем
-        available = all_mks
-        shown_links = []
+        available, state['shown_links'] = state['all_mks'], []
     
-    selected = weighted_random_choice(available, k=3, exclude_links=shown_links)
+    selected = weighted_random_choice(available, k=3)
+    if not selected: return await callback.answer("Больше МК нет 😔", show_alert=True)
     
-    if not selected:
-        await callback.answer("Больше МК нет 😔", show_alert=True)
-        return
-    
-    state['mks'] = selected
-    state['index'] = 0
-    state['shown_links'] = shown_links + [mk['link'] for mk in selected]
-    
+    state['mks'], state['index'] = selected, 0
+    state['shown_links'].extend([mk['link'] for mk in selected])
     mk = selected[0]
-    log_action(user_id, callback.from_user.username, "view", category, mk['link'])
+    log_to_sheet(callback.from_user.id, callback.from_user.username, "view", category, mk['link'])
     
     has_next = len(selected) > 1
-    has_more = len(all_mks) > len(state['shown_links'])
+    has_more = len(state['all_mks']) > len(state['shown_links'])
     
-    text = format_card(mk, 1, len(selected))
-    kb = get_card_keyboard(user_id, mk, 0, len(selected), has_next, has_more, category, False)
-    
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    await callback.message.edit_text(format_card(mk, 1, len(selected)), reply_markup=get_card_keyboard(callback.from_user.id, mk, 0, len(selected), has_next, has_more, category, False), parse_mode="HTML", disable_web_page_preview=True)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("fav_add_"))
@@ -430,18 +384,11 @@ async def add_to_favorites(callback: CallbackQuery):
     link = callback.data.split("fav_add_", 1)[1]
     mk = get_mk_by_link(link)
     if add_favorite(callback.from_user.id, link):
-        log_action(callback.from_user.id, callback.from_user.username, "favorite_add", mk['category'] if mk else "", link)
+        log_to_sheet(callback.from_user.id, callback.from_user.username, "favorite_add", mk['category'] if mk else "", link)
         await callback.answer("❤️ Добавлено в избранное!", show_alert=False)
-        # Обновляем клавиатуру
         if callback.from_user.id in user_state:
             state = user_state[callback.from_user.id]
-            has_next = state['index'] < len(state['mks']) - 1
-            has_more = len(state['all_mks']) > len(state['shown_links'])
-            kb = get_card_keyboard(
-                callback.from_user.id, mk, state['index'], len(state['mks']),
-                has_next, has_more, state['category'], state['from_favorites']
-            )
-            await callback.message.edit_reply_markup(reply_markup=kb)
+            await callback.message.edit_reply_markup(reply_markup=get_card_keyboard(callback.from_user.id, mk, state['index'], len(state['mks']), state['index'] < len(state['mks']) - 1, len(state['all_mks']) > len(state['shown_links']), state['category'], state['from_favorites']))
     else:
         await callback.answer("Уже в избранном", show_alert=True)
 
@@ -450,85 +397,44 @@ async def remove_from_favorites(callback: CallbackQuery):
     link = callback.data.split("fav_remove_", 1)[1]
     mk = get_mk_by_link(link)
     if remove_favorite(callback.from_user.id, link):
-        log_action(callback.from_user.id, callback.from_user.username, "favorite_remove", mk['category'] if mk else "", link)
+        log_to_sheet(callback.from_user.id, callback.from_user.username, "favorite_remove", mk['category'] if mk else "", link)
         await callback.answer("💔 Удалено из избранного", show_alert=False)
-        # Если в избранном — обновляем список
         if callback.from_user.id in user_state and user_state[callback.from_user.id].get('from_favorites'):
             await show_favorites_list(callback)
-        else:
-            # Иначе обновляем кнопку на карточке
-            if callback.from_user.id in user_state:
-                state = user_state[callback.from_user.id]
-                has_next = state['index'] < len(state['mks']) - 1
-                has_more = len(state['all_mks']) > len(state['shown_links'])
-                kb = get_card_keyboard(
-                    callback.from_user.id, mk, state['index'], len(state['mks']),
-                    has_next, has_more, state['category'], state['from_favorites']
-                )
-                await callback.message.edit_reply_markup(reply_markup=kb)
+        elif callback.from_user.id in user_state:
+            state = user_state[callback.from_user.id]
+            await callback.message.edit_reply_markup(reply_markup=get_card_keyboard(callback.from_user.id, mk, state['index'], len(state['mks']), state['index'] < len(state['mks']) - 1, len(state['all_mks']) > len(state['shown_links']), state['category'], state['from_favorites']))
     else:
         await callback.answer("Не найдено в избранном", show_alert=True)
 
 @router.callback_query(F.data == "show_fav")
 async def show_favorites(callback: CallbackQuery):
-    log_action(callback.from_user.id, callback.from_user.username, "favorites_view")
+    log_to_sheet(callback.from_user.id, callback.from_user.username, "favorites_view")
     await show_favorites_list(callback)
 
 async def show_favorites_list(callback: CallbackQuery):
-    favorites_links = get_user_favorites(callback.from_user.id)
+    fav_links = get_user_favorites(callback.from_user.id)
+    if not fav_links:
+        return await callback.message.answer("❤️ <b>Ваше избранное пусто</b>\n\nНажимайте «❤️ В избранное» под карточками.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 В главное меню", callback_data="start")]]))
     
-    if not favorites_links:
-        await callback.message.answer(
-            "❤️ <b>Ваше избранное пусто</b>\n\n"
-            "Нажимайте «❤️ В избранное» под карточками МК, чтобы сохранять понравившиеся.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 В главное меню", callback_data="start")]
-            ])
-        )
-        return
+    fav_mks = [mk for mk in load_mk_data() if mk['link'] in fav_links]
+    if not fav_mks:
+        return await callback.message.answer("❤️ <b>Ваше избранное</b>\n\nСохранённые МК больше не доступны в базе.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 В главное меню", callback_data="start")]]))
     
-    all_data = load_mk_data()
-    favorites_mks = [mk for mk in all_data if mk['link'] in favorites_links]
-    
-    if not favorites_mks:
-        await callback.message.answer(
-            "❤️ <b>Ваше избранное</b>\n\n"
-            "Сохранённые МК больше не доступны в базе.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 В главное меню", callback_data="start")]
-            ])
-        )
-        return
-    
-    # Компактный список избранного
-    parts = ["<b>❤️ Ваше избранное:</b>\n"]
-    buttons = []
-    
-    for i, mk in enumerate(favorites_mks, 1):
-        parts.append(f"<b>{i}. {mk['name']}</b>")
-        if mk.get('category'):
-            parts.append(f"   Категория: {mk['category']}")
-        if mk.get('link'):
-            parts.append(f"   🔗 <a href='{mk['link']}'>Ссылка</a>")
-        parts.append("")
-        
-        # Кнопка удаления для каждого МК
+    parts, buttons = ["<b>❤️ Ваше избранное:</b>\n"], []
+    for i, mk in enumerate(fav_mks, 1):
+        parts.extend([f"<b>{i}. {mk['name']}</b>", f"   Категория: {mk['category']}", f"   🔗 <a href='{mk['link']}'>Ссылка</a>", ""])
         buttons.append([InlineKeyboardButton(text=f"🗑 Удалить #{i}", callback_data=f"fav_remove_{mk['link']}")])
     
-    # Кнопки управления
-    buttons.append([InlineKeyboardButton(text="🗑 Очистить всё избранное", callback_data="clear_fav")])
-    buttons.append([InlineKeyboardButton(text="📋 В главное меню", callback_data="start")])
+    buttons.extend([[InlineKeyboardButton(text="🗑 Очистить всё избранное", callback_data="clear_fav")], [InlineKeyboardButton(text="📋 В главное меню", callback_data="start")]])
     
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    
-    await callback.message.answer("\n".join(parts), reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    user_state[callback.from_user.id] = {'category': 'favorites', 'index': 0, 'mks': fav_mks, 'all_mks': fav_mks, 'shown_links': [fav_mks[0]['link']], 'from_favorites': True}
+    await callback.message.answer("\n".join(parts), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML", disable_web_page_preview=True)
 
 @router.callback_query(F.data == "clear_fav")
 async def clear_favorites_handler(callback: CallbackQuery):
     if clear_favorites(callback.from_user.id):
-        log_action(callback.from_user.id, callback.from_user.username, "favorites_clear")
+        log_to_sheet(callback.from_user.id, callback.from_user.username, "favorites_clear")
         await callback.answer("🗑 Избранное очищено!", show_alert=True)
         await show_favorites_list(callback)
     else:
@@ -540,21 +446,16 @@ async def random_mk(target):
     data = load_mk_data()
     if not data:
         text = "😔 Пока нет МК в базе."
-        if isinstance(target, CallbackQuery):
-            await target.message.answer(text, parse_mode="HTML")
-        else:
-            await target.answer(text, parse_mode="HTML")
-        return
+        return await (target.message.answer if isinstance(target, CallbackQuery) else target.answer)(text, parse_mode="HTML")
     
     mk = weighted_random_choice(data, k=1)[0]
-    log_action(target.from_user.id, target.from_user.username, "random", mk['category'], mk['link'])
-    
-    text = "<b>🎲 Случайный МК:</b>\n\n" + format_card(mk, 1, 1)
+    log_to_sheet(target.from_user.id, target.from_user.username, "random", mk['category'], mk['link'])
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎲 Ещё случайный", callback_data="random")],
         [InlineKeyboardButton(text="📋 В главное меню", callback_data="start")]
     ])
+    text = "<b>🎲 Случайный МК:</b>\n\n" + format_card(mk, 1, 1)
     
     if isinstance(target, CallbackQuery):
         await target.message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
@@ -568,52 +469,25 @@ async def go_start(callback: CallbackQuery):
 
 @router.message(Command("stats"))
 async def admin_stats(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    if not os.path.exists(ANALYTICS_FILE):
-        await message.answer("📊 Статистика пока пуста.")
-        return
-    
-    with open(ANALYTICS_FILE, 'r', encoding='utf-8') as f:
-        try:
-            records = json.load(f)
-        except:
-            await message.answer("❌ Ошибка чтения статистики.")
-            return
-    
-    now = datetime.now()
-    today = now.date()
-    
-    today_records = [r for r in records if datetime.fromisoformat(r['time']).date() == today]
-    total_users = len(set(r['user_id'] for r in today_records))
-    starts = len([r for r in today_records if r['action'] == 'start'])
-    categories = len([r for r in today_records if r['action'] == 'category'])
-    views = len([r for r in today_records if r['action'] == 'view'])
-    
-    cat_counts = {}
-    for r in records:
-        if r['action'] == 'category' and r.get('category'):
-            cat = r['category']
-            cat_counts[cat] = cat_counts.get(cat, 0) + 1
-    top_cats = sorted(cat_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-    
-    stats_text = (
-        f"📊 <b>Статистика за сегодня:</b>\n\n"
-        f"👥 Уникальных пользователей: {total_users}\n"
-        f"🚀 /start: {starts}\n"
-        f"📂 Выбор категории: {categories}\n"
-        f"👁 Просмотров карточек: {views}\n\n"
-        f"🔥 <b>Топ категорий (всего):</b>\n"
-    )
-    for cat, count in top_cats:
-        stats_text += f"  • {cat}: {count}\n"
-    
-    await message.answer(stats_text, parse_mode="HTML")
+    if message.from_user.id != ADMIN_ID or not sheet: return
+    try:
+        records = sheet.get_all_records()
+        today = datetime.now().date()
+        today_recs = [r for r in records if r.get('timestamp') and datetime.strptime(str(r['timestamp'])[:19], "%Y-%m-%d %H:%M:%S").date() == today]
+        
+        stats_text = (f"📊 <b>Статистика за сегодня:</b>\n\n"
+            f"👥 Уникальных: {len(set(r.get('user_id') for r in today_recs if r.get('user_id')))}\n"
+            f"🚀 /start: {len([r for r in today_recs if r.get('action') == 'start'])}\n"
+            f"👁 Просмотров: {len([r for r in today_recs if r.get('action') == 'view'])}\n\n🔥 <b>Топ категорий:</b>\n")
+        for cat, count in sorted({r.get('category'): 0 for r in records if r.get('action') == 'category'}.items(), key=lambda x: sum(1 for r in records if r.get('action') == 'category' and r.get('category') == x[0]), reverse=True)[:5]:
+            stats_text += f"  • {cat}: {sum(1 for r in records if r.get('action') == 'category' and r.get('category') == cat)}\n"
+        await message.answer(stats_text, parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
 
 # ================= ЗАПУСК =================
 async def main():
-    print("✅ Бот успешно запущен!")
+    print("✅ Бот успешно запущен с Google Sheets аналитикой!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
