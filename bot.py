@@ -2,10 +2,10 @@
 import os, json, random, csv, urllib.request, time
 from datetime import datetime
 import gspread
-from aiogram import Bot, Dispatcher, F, Router, Update
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import Update, Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.exceptions import TelegramForbiddenError
 
 # ================= НАСТРОЙКИ =================
